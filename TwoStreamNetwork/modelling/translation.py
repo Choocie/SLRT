@@ -11,7 +11,7 @@ class TranslationNetwork(torch.nn.Module):
         self.logger = get_logger()
         self.task = task
         self.input_type = input_type
-        assert self.input_type in ['gloss','feature']
+        assert self.input_type in ['feature']
         self.text_tokenizer = TextTokenizer(tokenizer_cfg=cfg['TextTokenizer'])
 
         if 'pretrained_model_name_or_path' in cfg:
@@ -168,33 +168,36 @@ class TranslationNetwork(torch.nn.Module):
             else:
                 inputs_embeds.append(feature_w_suffix)
             attention_mask[ii, :valid_len+suffix_len] = 1
-        transformer_inputs = {
-            'inputs_embeds': torch.stack(inputs_embeds, dim=0)*self.input_embed_scale, #B,T,D
-            'attention_mask': attention_mask#attention_mask
-        }
-        return transformer_inputs
 
-    def forward(self,**kwargs):
-        if self.input_type=='gloss':
-            input_ids = kwargs.pop('input_ids')
-            kwargs['inputs_embeds'] = self.prepare_gloss_inputs(input_ids)
-        elif self.input_type=='feature':
-            input_feature = kwargs.pop('input_feature')
-            input_lengths = kwargs.pop('input_lengths')
-            #quick fix
-            kwargs.pop('gloss_ids', None)
-            kwargs.pop('gloss_lengths', None)
-            new_kwargs = self.prepare_feature_inputs(input_feature, input_lengths)
-            kwargs = {**kwargs, **new_kwargs}
-        else:
-            raise ValueError
-        output_dict = self.model(**kwargs, return_dict=True)
+        return torch.stack(inputs_embeds, dim=0)*self.input_embed_scale, attention_mask
+
+    def forward(
+            self,
+            input_feature,
+            input_lengths,
+            gloss_ids=None,
+            gloss_lengths=None,
+            **kwargs):
+
+        inputs_embeds,attention_mask = self.prepare_feature_inputs(input_feature, input_lengths)
+
+        output_dict = self.model(
+            input_feature=input_feature,
+            input_lengths=input_lengths,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True)
         #print(output_dict.keys()) loss, logits, past_key_values, encoder_last_hidden_state
         log_prob = torch.nn.functional.log_softmax(output_dict['logits'], dim=-1)  # B, T, L
         batch_loss_sum = self.translation_loss_fun(log_probs=log_prob,targets=kwargs['labels'])
         output_dict['translation_loss'] = batch_loss_sum/log_prob.shape[0]
 
-        output_dict['transformer_inputs'] = kwargs #for later use (decoding)
+        output_dict['transformer_inputs'] = {
+            'input_feature': input_feature,
+            'input_lengths': input_lengths,
+            'inputs_embeds': inputs_embeds,
+            'attention_mask': attention_mask} 
+        
         return output_dict
 
     def generate(self, 

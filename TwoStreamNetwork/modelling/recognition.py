@@ -41,9 +41,11 @@ class RecognitionNetwork(torch.nn.Module):
         logger = get_logger()
         self.cfg = cfg
         self.input_type = input_type
+        assert(input_type=='feature')
         self.gloss_tokenizer = GlossTokenizer_S2G(
             cfg['GlossTokenizer'])
         self.input_streams = input_streams
+        assert(self.input_streams==['rgb'])
         self.fuse_method = cfg.get('fuse_method', 'empty')
         self.heatmap_cfg = cfg.get('heatmap_cfg',{})
         self.transform_cfg = transform_cfg
@@ -327,390 +329,47 @@ class RecognitionNetwork(torch.nn.Module):
             sgn_heatmaps = sgn_heatmaps.permute(0,2,1,3,4).float()
         return sgn_videos, sgn_heatmaps
 
-    def forward(self, is_train, gloss_labels, gls_lengths,
-        sgn_features=None, sgn_mask=None,
-        sgn_videos=None, sgn_lengths=None,
-        sgn_keypoints=None,
-        head_rgb_input=None, head_keypoint_input=None):
-        if self.input_type=='video':
-            s3d_outputs = []
-            with torch.no_grad():
-                if 'keypoint' in self.input_streams:
-                    assert sgn_keypoints!=None
-                    sgn_heatmaps = self.generate_batch_heatmap(
-                            sgn_keypoints) 
-                else:
-                    sgn_heatmaps = None
-                
-                if not 'rgb' in self.input_streams:
-                    sgn_videos = None
+    def forward(self,
+                is_train,
+                gloss_labels,
+                gls_lengths,
+                sgn_features=None,
+                sgn_mask=None,
+                sgn_videos=None,
+                sgn_lengths=None,
+                sgn_keypoints=None,
+                head_rgb_input=None, 
+                head_keypoint_input=None):
 
-                sgn_videos,sgn_heatmaps = self.augment_preprocess_inputs(is_train=is_train, sgn_videos=sgn_videos, sgn_heatmaps=sgn_heatmaps)
-            if 'rgb' in self.input_streams and not 'keypoint' in self.input_streams:              
-                s3d_outputs = self.visual_backbone(sgn_videos=sgn_videos, sgn_lengths=sgn_lengths)
-            elif 'keypoint' in self.input_streams and not 'rgb' in self.input_streams:
-                s3d_outputs = self.visual_backbone_keypoint(sgn_videos=sgn_heatmaps, sgn_lengths=sgn_lengths)                
-            elif 'rgb' in self.input_streams and 'keypoint' in self.input_streams:
-                s3d_outputs = self.visual_backbone_twostream(x_rgb=sgn_videos, x_pose=sgn_heatmaps, sgn_lengths=sgn_lengths)
+        aux_prob_log = {'rgb':[],'keypoint':[]}
+        head_outputs = self.visual_head(x=head_rgb_input, mask=sgn_mask)
+        valid_len_out = sgn_lengths 
 
-            aux_prob_log = {'rgb': [], 'keypoint': []}
-            aux_prob = {'rgb': [], 'keypoint': []}
-            aux_logits = {'rgb': [], 'keypoint': []}
-            aux_lengths = {'rgb': [], 'keypoint': []}
-            if self.fuse_method=='empty':
-                assert len(self.input_streams)==1, self.input_streams
-                assert self.cfg['pyramid']['rgb'] == self.cfg['pyramid']['pose']
-                if 'rgb' in self.input_streams:
-                    if self.cfg['pyramid']['rgb'] == 'shared_head':
-                        for i in range(len(s3d_outputs['fea_lst'])):
-                            s3d_outputs['fea_lst'][i] = self.fc_layers_rgb[i](s3d_outputs['fea_lst'][i])
-                        s3d_outputs['sgn_feature'] = s3d_outputs['fea_lst'][-1]
-                    head_outputs = self.visual_head(
-                        x=s3d_outputs['sgn'],
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                    head_outputs['head_rgb_input'] = s3d_outputs['sgn']
-                    if self.cfg['pyramid']['rgb'] == 'multi_head':
-                        for i in range(len(self.visual_head_remain)):
-                            head_ops = self.visual_head_remain[i](x=s3d_outputs['fea_lst'][i], 
-                                                                    mask=s3d_outputs['sgn_mask'][i], 
-                                                                    valid_len_in=s3d_outputs['valid_len_out'][i])
-                            aux_prob_log['rgb'].append(head_ops['gloss_probabilities_log'])
-                            aux_prob['rgb'].append(head_ops['gloss_probabilities'])
-                            aux_logits['rgb'].append(head_ops['gloss_logits'])
-                            aux_lengths['rgb'].append(head_ops['valid_len_out'])
-                    elif self.cfg['pyramid']['rgb'] == 'shared_head':
-                        for i in range(self.cfg['s3d']['use_block']-2):
-                            head_ops = self.visual_head(x=s3d_outputs['fea_lst'][i], 
-                                                        mask=s3d_outputs['sgn_mask'][i], 
-                                                        valid_len_in=s3d_outputs['valid_len_out'][i])
-                            aux_prob_log['rgb'].append(head_ops['gloss_probabilities_log'])
-                            aux_prob['rgb'].append(head_ops['gloss_probabilities'])
-                            aux_logits['rgb'].append(head_ops['gloss_logits'])
-                            aux_lengths['rgb'].append(head_ops['valid_len_out'])
-                elif 'keypoint' in self.input_streams:
-                    if self.cfg['pyramid']['pose'] == 'shared_head':
-                        for i in range(len(s3d_outputs['fea_lst'])):
-                            s3d_outputs['fea_lst'][i] = self.fc_layers_keypoint[i](s3d_outputs['fea_lst'][i])
-                        s3d_outputs['sgn_feature'] = s3d_outputs['fea_lst'][-1]
-                    head_outputs = self.visual_head_keypoint(
-                        x=s3d_outputs['sgn'],
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                    head_outputs['head_keypoint_input'] = s3d_outputs['sgn']
-                    if self.cfg['pyramid']['pose'] == 'multi_head':
-                        for i in range(len(self.visual_head_keypoint_remain)):
-                            head_ops = self.visual_head_keypoint_remain[i](x=s3d_outputs['fea_lst'][i], 
-                                                                            mask=s3d_outputs['sgn_mask'][i], 
-                                                                            valid_len_in=s3d_outputs['valid_len_out'][i])
-                            aux_prob_log['keypoint'].append(head_ops['gloss_probabilities_log'])
-                            aux_prob['keypoint'].append(head_ops['gloss_probabilities'])
-                            aux_logits['keypoint'].append(head_ops['gloss_logits'])
-                            aux_lengths['rgb'].append(head_ops['valid_len_out'])
-                    elif self.cfg['pyramid']['pose'] == 'shared_head':
-                        for i in range(self.cfg['s3d']['use_block']-2):
-                            head_ops = self.visual_head_keypoint(x=s3d_outputs['fea_lst'][i], 
-                                                                mask=s3d_outputs['sgn_mask'][i], 
-                                                                valid_len_in=s3d_outputs['valid_len_out'][i])
-                            aux_prob_log['keypoint'].append(head_ops['gloss_probabilities_log'])
-                            aux_prob['keypoint'].append(head_ops['gloss_probabilities'])
-                            aux_logits['keypoint'].append(head_ops['gloss_logits'])
-                            aux_lengths['rgb'].append(head_ops['valid_len_out'])
-                else:
-                    raise ValueError
-                head_outputs['valid_len_out_lst'] = s3d_outputs['valid_len_out']
-
-            elif self.fuse_method=='s3d_pooled_plus':
-                assert 'rgb' in self.input_streams and 'keypoint' in self.input_streams
-                sgn_features = torch.stack(
-                    [s3d_outputs['sgn_feature'],s3d_outputs['pose_feature']], 
-                    dim=0)
-                fused_sgn_features = torch.sum(sgn_features, dim=0)
-                head_outputs = self.visual_head(
-                    x=fused_sgn_features, 
-                    mask=s3d_outputs['sgn_mask'][0], 
-                    valid_len_in=s3d_outputs['valid_len_out'][0])
-            elif 'doublehead' in self.fuse_method or 'triplehead' in self.fuse_method:
-                assert 'rgb' in self.input_streams and 'keypoint' in self.input_streams
-                # rgb
-                if self.cfg['pyramid']['rgb'] is None:
-                    head_outputs_rgb = self.visual_head(
-                        x=s3d_outputs['sgn_feature'], 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                    head_rgb_input = s3d_outputs['sgn_feature']
-                elif self.cfg['pyramid']['rgb'] == 'multi_head':
-                    head_outputs_rgb = self.visual_head(
-                        x=s3d_outputs['rgb_fea_lst'][-1], 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                    head_rgb_input = s3d_outputs['rgb_fea_lst'][-1]
-                elif 'fused' in self.cfg['pyramid']['rgb']:
-                    head_outputs_rgb = self.visual_head(
-                        x=s3d_outputs['rgb_fused'], 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                    head_rgb_input = s3d_outputs['rgb_fused']
-                elif self.cfg['pyramid']['rgb'] == 'shared_head':
-                    for i in range(len(s3d_outputs['rgb_fea_lst'])):
-                        s3d_outputs['rgb_fea_lst'][i] = self.fc_layers_rgb[i](s3d_outputs['rgb_fea_lst'][i])
-                    head_outputs_rgb = self.visual_head(
-                        x=s3d_outputs['rgb_fea_lst'][-1], 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                    head_rgb_input = s3d_outputs['rgb_fea_lst'][-1]
-                    for i in range(len(self.fc_layers_rgb)-1):
-                        head_ops = self.visual_head(x=s3d_outputs['rgb_fea_lst'][i], 
-                                                    mask=s3d_outputs['sgn_mask'][i], 
-                                                    valid_len_in=s3d_outputs['valid_len_out'][i])
-                        aux_prob_log['rgb'].append(head_ops['gloss_probabilities_log'])
-                        aux_prob['rgb'].append(head_ops['gloss_probabilities'])
-                        aux_logits['rgb'].append(head_ops['gloss_logits'])
-                        aux_lengths['rgb'].append(head_ops['valid_len_out'])
-                
-                if self.cfg['pyramid']['rgb'] is not None and 'multi' in self.cfg['pyramid']['rgb']:
-                    for i in range(len(self.visual_head_remain)):
-                        head_ops = self.visual_head_remain[i](x=s3d_outputs['rgb_fea_lst'][i], 
-                                                                mask=s3d_outputs['sgn_mask'][i], 
-                                                                valid_len_in=s3d_outputs['valid_len_out'][i])
-                        aux_prob_log['rgb'].append(head_ops['gloss_probabilities_log'])
-                        aux_prob['rgb'].append(head_ops['gloss_probabilities'])
-                        aux_logits['rgb'].append(head_ops['gloss_logits'])
-                        aux_lengths['rgb'].append(head_ops['valid_len_out'])
-
-                # keypoint
-                if self.cfg['pyramid']['pose'] is None:
-                    head_keypoint_input = s3d_outputs['pose_feature']
-                    head_outputs_keypoint = self.visual_head_keypoint(
-                        x=s3d_outputs['pose_feature'], 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                elif self.cfg['pyramid']['pose'] == 'multi_head':
-                    head_keypoint_input = s3d_outputs['pose_fea_lst'][-1]
-                    head_outputs_keypoint = self.visual_head_keypoint(
-                            x=s3d_outputs['pose_fea_lst'][-1], 
-                            mask=s3d_outputs['sgn_mask'][-1], 
-                            valid_len_in=s3d_outputs['valid_len_out'][-1])
-                elif 'fused' in self.cfg['pyramid']['pose']:
-                    head_keypoint_input = s3d_outputs['pose_fused']
-                    head_outputs_keypoint = self.visual_head_keypoint(
-                        x=s3d_outputs['pose_fused'], 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                elif self.cfg['pyramid']['pose'] == 'shared_head':
-                    head_keypoint_input = s3d_outputs['pose_fea_lst'][-1]
-                    for i in range(len(s3d_outputs['pose_fea_lst'])):
-                        s3d_outputs['pose_fea_lst'][i] = self.fc_layers_keypoint[i](s3d_outputs['pose_fea_lst'][i])
-                    head_outputs_keypoint = self.visual_head_keypoint(
-                        x=s3d_outputs['pose_fea_lst'][-1], 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1])
-                    for i in range(len(self.fc_layers_keypoint)-1):
-                        head_ops = self.visual_head_keypoint(x=s3d_outputs['pose_fea_lst'][i], 
-                                                    mask=s3d_outputs['sgn_mask'][i], 
-                                                    valid_len_in=s3d_outputs['valid_len_out'][i])
-                        aux_prob_log['keypoint'].append(head_ops['gloss_probabilities_log'])
-                        aux_prob['keypoint'].append(head_ops['gloss_probabilities'])
-                        aux_logits['keypoint'].append(head_ops['gloss_logits'])
-                        aux_lengths['keypoint'].append(head_ops['valid_len_out'])
-                
-                if self.cfg['pyramid']['pose'] is not None and 'multi' in self.cfg['pyramid']['pose']:
-                    for i in range(len(self.visual_head_keypoint_remain)):
-                        head_ops = self.visual_head_keypoint_remain[i](x=s3d_outputs['pose_fea_lst'][i], 
-                                                                mask=s3d_outputs['sgn_mask'][i], 
-                                                                valid_len_in=s3d_outputs['valid_len_out'][i])
-                        aux_prob_log['keypoint'].append(head_ops['gloss_probabilities_log'])
-                        aux_prob['keypoint'].append(head_ops['gloss_probabilities'])
-                        aux_logits['keypoint'].append(head_ops['gloss_logits'])
-                        aux_lengths['keypoint'].append(head_ops['valid_len_out'])
-
-                head_outputs = {'gloss_logits': None, 
-                                'rgb_gloss_logits': head_outputs_rgb['gloss_logits'],
-                                'keypoint_gloss_logits': head_outputs_keypoint['gloss_logits'],
-                                'gloss_probabilities_log':None,
-                                'rgb_gloss_probabilities_log': head_outputs_rgb['gloss_probabilities_log'],
-                                'keypoint_gloss_probabilities_log': head_outputs_keypoint['gloss_probabilities_log'],
-                                'gloss_probabilities': None,
-                                'rgb_gloss_probabilities': head_outputs_rgb['gloss_probabilities'],
-                                'keypoint_gloss_probabilities': head_outputs_keypoint['gloss_probabilities'],
-                                'valid_len_out': head_outputs_rgb['valid_len_out'],
-                                'valid_len_out_lst': s3d_outputs['valid_len_out'],
-                                'head_rgb_input': head_rgb_input, 'head_keypoint_input': head_keypoint_input,
-                                'aux_logits': aux_logits, 'aux_lengths':aux_lengths, 
-                                'aux_prob_log':aux_prob_log, 'aux_prob':aux_prob}
-                if 'triplehead' in self.fuse_method:
-                    assert self.visual_head_fuse!=None
-                    if 'plus' in self.fuse_method:
-                        fused_sgn_features = head_rgb_input+head_keypoint_input
-                    elif 'cat' in self.fuse_method:
-                        if self.cfg.get('cat_order', 'pose_first')=='rgb_first':
-                            fused_sgn_features = torch.cat([head_rgb_input, head_keypoint_input], dim=-1)
-                        else:
-                            fused_sgn_features = torch.cat([head_keypoint_input, head_rgb_input], dim=-1) #B,T,D
-                    else:
-                        raise ValueError
-                    head_outputs_fuse = self.visual_head_fuse(
-                        x=fused_sgn_features, 
-                        mask=s3d_outputs['sgn_mask'][-1], 
-                        valid_len_in=s3d_outputs['valid_len_out'][-1]) 
-                    head_outputs['fuse_gloss_probabilities'] = head_outputs_fuse['gloss_probabilities']
-                    head_outputs['fuse_gloss_probabilities_log'] = head_outputs_fuse['gloss_probabilities_log']
-                    head_outputs['fuse_gloss_logits'] = head_outputs_fuse['gloss_logits']
-                    head_outputs['fuse_gloss_feature'] = head_outputs_fuse['gloss_feature']
-                    head_outputs['head_fuse_input'] = fused_sgn_features
- 
-                if 'doublehead' in self.fuse_method:   
-                    sum_probs = head_outputs['rgb_gloss_probabilities']+head_outputs['keypoint_gloss_probabilities']
-                    head_outputs['ensemble_last_gloss_logits'] = sum_probs.log()
-                elif 'triplehead' in self.fuse_method:
-                    head_outputs['ensemble_last_gloss_logits'] = (head_outputs['fuse_gloss_probabilities']+\
-                        head_outputs['rgb_gloss_probabilities']+head_outputs['keypoint_gloss_probabilities']).log()
-                else:
-                    raise ValueError 
-                head_outputs['ensemble_last_gloss_probabilities_log'] = head_outputs['ensemble_last_gloss_logits'].log_softmax(2) 
-                head_outputs['ensemble_last_gloss_probabilities'] = head_outputs['ensemble_last_gloss_logits'].softmax(2)   
-
-                if self.cfg['pyramid']['rgb'] == 'multi_head' and self.cfg['pyramid']['pose'] == 'multi_head' :
-                    head_outputs['ensemble_early_gloss_logits'] = (aux_prob['rgb'][-1]+aux_prob['keypoint'][-1]).log() #(aux_prob['rgb'][2]+aux_prob['keypoint'][2]).log() 
-                    head_outputs['ensemble_early_gloss_probabilities_log'] = head_outputs['ensemble_early_gloss_logits'].log_softmax(2) 
-                    head_outputs['ensemble_early_gloss_probabilities'] = head_outputs['ensemble_early_gloss_logits'].softmax(2)                      
-            else:
-                raise ValueError
-            valid_len_out = head_outputs['valid_len_out']
-            
-        elif self.input_type=='feature':
-            aux_prob_log = {'rgb':[],'keypoint':[]}
-            if self.input_streams==['rgb']: 
-                head_outputs = self.visual_head(x=head_rgb_input, mask=sgn_mask)
-                valid_len_out = sgn_lengths 
-            elif self.input_streams == ['keypoint']:
-                head_outputs = self.visual_head_keypoint(x=head_keypoint_input, mask=sgn_mask)
-                valid_len_out = sgn_lengths
-            else: 
-                visual_head_dict = {'rgb':self.visual_head, 'keypoint':self.visual_head_keypoint}
-                head_input_dict = {'rgb': head_rgb_input, 'keypoint':head_keypoint_input}
-                if 'triplehead' in self.fuse_method:
-                    visual_head_dict['fuse'] = self.visual_head_fuse
-                    if 'plus' in self.fuse_method:
-                        head_input_dict['fuse'] = head_rgb_input+head_keypoint_input
-                    elif 'cat' in self.fuse_method:
-                        if self.cfg.get('cat_order', 'pose_first')=='rgb_first':
-                            head_input_dict['fuse'] = torch.cat([head_rgb_input, head_keypoint_input], dim=-1)
-                        else:
-                            head_input_dict['fuse'] = torch.cat([head_keypoint_input, head_rgb_input], dim=-1)
-                    else:
-                        raise ValueError
-                head_outputs = {}
-                head_outputs['ensemble_last_gloss_logits'] = 0
-                for k, visual_head in visual_head_dict.items():
-                    outputs = visual_head(x=head_input_dict[k], mask=sgn_mask, valid_len_in=sgn_lengths)
-                    for k_, v in outputs.items():
-                        head_outputs[f'{k}_{k_}'] = v 
-                    head_outputs['ensemble_last_gloss_logits'] += outputs['gloss_probabilities']
-                head_outputs['ensemble_last_gloss_logits'] = head_outputs['ensemble_last_gloss_logits'].log()
-                head_outputs['valid_len_out'] = outputs['valid_len_out']
-                head_outputs['ensemble_last_gloss_probabilities_log'] = head_outputs['ensemble_last_gloss_logits'].log_softmax(2) 
-                head_outputs['ensemble_last_gloss_probabilities'] = head_outputs['ensemble_last_gloss_logits'].softmax(2)  
-                valid_len_out = sgn_lengths
-        else:
-            raise ValueError
 
         outputs = {**head_outputs,
-            'input_lengths': valid_len_out}        
-        if self.fuse_method=='empty':
+            'input_lengths': valid_len_out}  
+        assert(self.fuse_method=='empty')
+        if gloss_labels is not None:
             outputs['recognition_loss'] = self.compute_recognition_loss(
                 gloss_labels=gloss_labels, gloss_lengths=gls_lengths,
                 gloss_probabilities_log=head_outputs['gloss_probabilities_log'],
                 input_lengths=valid_len_out
             )
-            self.cfg['gloss_feature_ensemble'] = self.cfg.get('gloss_feature_ensemble','gloss_feature')
-            outputs['gloss_feature'] = outputs[self.cfg['gloss_feature_ensemble']]
-            for i in range(len(aux_prob_log[self.input_streams[0]])):
+        self.cfg['gloss_feature_ensemble'] = self.cfg.get('gloss_feature_ensemble','gloss_feature')
+        outputs['gloss_feature'] = outputs[self.cfg['gloss_feature_ensemble']]
+        for i in range(len(aux_prob_log[self.input_streams[0]])):
+            if gloss_labels is not None:
                 outputs['recognition_loss'] += self.cfg['pyramid']['head_weight'] * self.compute_recognition_loss(
                         gloss_labels=gloss_labels, gloss_lengths=gls_lengths,
                         gloss_probabilities_log=aux_prob_log[self.input_streams[0]][i],
                         input_lengths=head_outputs['valid_len_out_lst'][i])
-        elif 'triplehead' in self.fuse_method:
-            assert 'rgb' in self.input_streams and 'keypoint' in self.input_streams
-            if 'head_weight' in self.cfg['pyramid']:
-                self.cfg['pyramid']['head_weight_rgb'] = self.cfg['pyramid']['head_weight_keypoint'] = self.cfg['pyramid']['head_weight']
-            for k in ['rgb', 'keypoint','fuse']:
-                if f'{k}_gloss_probabilities_log' in head_outputs:
-                    outputs[f'recognition_loss_{k}'] = self.compute_recognition_loss(
-                    gloss_labels=gloss_labels, gloss_lengths=gls_lengths,
-                    gloss_probabilities_log=head_outputs[f'{k}_gloss_probabilities_log'],
-                    input_lengths=valid_len_out)
 
-                if k in aux_prob_log:
-                    for i in range(len(aux_prob_log[k])):
-                        outputs[f'recognition_loss_{k}'] += self.cfg['pyramid'][f'head_weight_{k}'] * self.compute_recognition_loss(
-                            gloss_labels=gloss_labels, gloss_lengths=gls_lengths,
-                            gloss_probabilities_log=aux_prob_log[k][i],
-                            input_lengths=head_outputs['valid_len_out_lst'][i])
-            self.cfg['gloss_feature_ensemble'] = self.cfg.get('gloss_feature_ensemble','fuse_gloss_feature')
-            if '@' in self.cfg['gloss_feature_ensemble']:
-                feat_name, agg = self.cfg['gloss_feature_ensemble'].split('@')
-                gloss_feature = [head_outputs[f'{k}_{feat_name}'] for k in ['fuse','rgb','keypoint']]
-                if agg == 'cat':
-                    gloss_feature = torch.cat(gloss_feature, dim=-1)
-                elif agg == 'plus':
-                    gloss_feature = sum(gloss_feature)
-                else:
-                    raise ValueError
-                outputs['gloss_feature'] = gloss_feature
-            else:
-                stream, feat_name = self.cfg['gloss_feature_ensemble'].split('_gloss_')
-                feat_name = 'gloss_'+feat_name
-                outputs['gloss_feature'] = outputs[f'{stream}_{feat_name}']
+        stream, feat_name = self.cfg['gloss_feature_ensemble'].split('_gloss_')
+        feat_name = 'gloss_'+feat_name
+        outputs['gloss_feature'] = outputs[f'{stream}_{feat_name}']
+        if gloss_labels is not None:
             outputs['recognition_loss'] = outputs['recognition_loss_rgb'] + outputs['recognition_loss_keypoint'] + outputs['recognition_loss_fuse']
-        else:
-            raise ValueError
-        
-        if 'cross_distillation' in self.cfg:
-            soft_or_hard = self.cfg['cross_distillation'].get('hard_or_soft','soft')
-            assert soft_or_hard in  ['soft','hard']
-            assert self.fuse_method in ['doublehead_bilateral', 'triplehead_cat_bilateral']
-            if soft_or_hard=='soft':
-                loss_func = torch.nn.KLDivLoss(reduction="batchmean")
-            else:
-                loss_func = torch.nn.CrossEntropyLoss(reduction='sum') #divided by batch_size
-            if type(self.cfg['cross_distillation']['types'])==list:
-                self.cfg['cross_distillation']['types']={t:self.cfg['cross_distillation'].get('loss_weight',1) 
-                    for t in self.cfg['cross_distillation']['types']}
-            for teaching_type, loss_weight in self.cfg['cross_distillation']['types'].items():
-                teacher = teaching_type.split('_teaches_')[0]
-                student = teaching_type.split('_teaches_')[1]
-                assert teacher in ['rgb', 'keypoint', 'ensemble_last','fuse','ensemble_early'], teacher#, 'fuse']
-                assert student in ['rgb', 'keypoint','fuse','auxes']
-                if soft_or_hard=='soft':
-                    teacher_prob = outputs[f'{teacher}_gloss_probabilities']
-                else:
-                    teacher_prob =  torch.argmax(outputs[f'{teacher}_gloss_probabilities'], dim=-1) #B,T,
-                if self.cfg['cross_distillation']['teacher_detach']==True:
-                    teacher_prob = teacher_prob.detach()
-                if student == 'auxes':
-                    outputs[f'{teaching_type}_loss'] = 0
-                    if soft_or_hard=='soft':
-                        for stream, gls_prob_log_lst in aux_prob_log.items():
-                            for student_log_prob in gls_prob_log_lst:
-                                assert teacher_prob.shape==student_log_prob.shape, (teacher_prob.shape, student_log_prob.shape)
-                                outputs[f'{teaching_type}_loss'] += loss_func(input=student_log_prob, target=teacher_prob)
-                    else:
-                        for stream, gls_logits in aux_logits.items():
-                            for student_logits in gls_logits:
-                                B, T, V = student_logits.shape
-                                outputs[f'{teaching_type}_loss'] += loss_func(input=student_logits.view(-1, V), target=teacher_prob.view(-1))/B
-                else:
-                    if soft_or_hard=='soft':
-                        student_log_prob = outputs[f'{student}_gloss_probabilities_log']
-                        outputs[f'{teaching_type}_loss'] = loss_func(input=student_log_prob, target=teacher_prob)
-                    else:
-                        student_logits = outputs[f'{student}_gloss_logits']
-                        B, T, V = student_logits.shape
-                        outputs[f'{teaching_type}_loss'] = loss_func(input=student_logits.view(-1, V), target=teacher_prob.view(-1))
-                        outputs[f'{teaching_type}_loss'] /=B 
-                outputs['recognition_loss'] += outputs[f'{teaching_type}_loss']*loss_weight
-
+    
         return outputs
     
 
